@@ -1,0 +1,18 @@
+# Install the environment by running: 
+# conda env create --file environment.yml
+name: snowflake-rai-graph-rag
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+- python==3.10
+- anaconda
+- pip
+- setuptools
+- wheel
+- pip:
+  - jupyterlab==4.2.2
+  - python-dotenv==1.0.1
+  - relationalai==0.3.4
+- conda:
+  - snowflake-snowpark-python==1.18.0
