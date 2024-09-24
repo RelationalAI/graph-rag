@@ -31,19 +31,27 @@ HANDLER = 'main'
 AS
 $$
 import json
+import logging
 import re
+
+logger = logging.getLogger("python_logger")
+logger.setLevel(logging.ERROR)
 
 def main(llm_response):
     payload = llm_response["choices"][0]["messages"]
-    
-    try:    
+    try:
         # Remove whitespaces.
         payload = " ".join(payload.split())
 
         # Extract JSON from the string.
         return json.loads(re.findall(r"{.+[:,].+}|\[.+[,:].+\]", payload)[0])
     except:
-        return json.loads(payload)
+        logger.error(f"Failed to parse {payload}, 1st attempt at re-parsing")
+        try:
+            return json.loads(payload)
+        except:
+            logger.error(f"Failed to parse {payload}, returning default")
+            return {}
 $$;
 
 CREATE OR REPLACE FUNCTION LLM_ENTITIES_RELATIONS(model VARCHAR, content VARCHAR, additional_prompts VARCHAR DEFAULT '') 
@@ -180,7 +188,8 @@ import networkx as nx
 import pandas as pd
 import snowflake.snowpark as snowpark
 
-logger = logging.getLogger("GRAPH_RAG")
+logger = logging.getLogger("python_logger")
+logger.setLevel(logging.ERROR)
 
 class GraphBuilder(object):
     def __init__(self) -> None:
@@ -310,7 +319,7 @@ class GraphBuilder(object):
             logger.error(error)
     
     def merge(self, graph) -> nx.Graph:
-        self._graph = nx.union(self._graph, graph)
+        self._graph = nx.disjoint_union(self._graph, graph)
 
     # Return accumulated graph nodes and edges.
     def finish(self) -> List:
@@ -327,82 +336,105 @@ RETURNS VARCHAR
 LANGUAGE SQL 
 AS 
 $$
-    BEGIN
-        CREATE OR REPLACE TEMPORARY TABLE nodes_edges_staging(nodes ARRAY, edges ARRAY);
+BEGIN
+    CREATE OR REPLACE TEMPORARY TABLE llm_response(corpus_id INTEGER, response VARIANT);
+    CREATE OR REPLACE TEMPORARY TABLE nodes_edges_staging(nodes ARRAY, edges ARRAY);
 
-        /***
-        * Extract node and edge objects with the LLM and temporarily store the output to staging tables.
-        **/
-        INSERT INTO nodes_edges_staging
-        WITH c AS (
-            SELECT 
-                c.id AS id
-                , c.content AS content
-            FROM 
-                corpus AS c
-        )
-        , entities_relations AS (
-            SELECT 
-                c.id AS corpus_id
-                , LLM_EXTRACT_JSON(r.response) AS response
-            FROM 
-                c
-            JOIN TABLE(LLM_ENTITIES_RELATIONS(:completions_model , c.content, '')) AS r
-        )
-        , nodes_edges AS (
-            SELECT
-                LLM_ENTITIES_RELATIONS_TO_GRAPH(er.corpus_id, er.response) AS graph
-            FROM
-                entities_relations AS er
-        )
-        SELECT 
-            ne.graph[0]::ARRAY AS nodes
-            , ne.graph[1]::ARRAY AS edges
-        FROM
-            nodes_edges AS ne;
+    /***
+    * Extract node and edge objects with the LLM and temporarily store the output to staging tables.
+    **/
 
-        /***
-        * Populate Data Stream source tables.
-        *
-        * These tables will be used for creating the downstream RelationalAI graph.
-        **/
-        -- Nodes table.
-        CREATE OR REPLACE TABLE nodes
-        AS
-        WITH nodes AS (
-            SELECT 
-                ne.nodes AS nodes
-            FROM 
-                nodes_edges_staging AS ne
-        )
+    /***
+    * Produce LLM responses stage.
+    **/
+    INSERT INTO llm_response
+    WITH c AS (
         SELECT 
-            VALUE:"id"::VARCHAR id 
-            , VALUE:"corpus_id"::INT corpus_id 
-            , VALUE:"type"::VARCHAR type 
-        FROM
-            nodes AS n 
-            , LATERAL FLATTEN(n.nodes) AS items;
-
-        -- Edges table.
-        CREATE OR REPLACE TABLE edges 
-        AS 
-        WITH edges AS ( 
-            SELECT 
-                ne.edges AS edges 
-            FROM 
-                nodes_edges_staging AS ne 
-        ) 
-        SELECT 
-            VALUE:"src_node_id"::VARCHAR src_node_id 
-            , VALUE:"dst_node_id"::VARCHAR dst_node_id 
-            , VALUE:"corpus_id"::INT corpus_id 
-            , VALUE:"type"::VARCHAR type 
+            c.id AS id
+            , c.content AS content
         FROM 
-            edges AS n 
-            , LATERAL FLATTEN(n.edges) AS items;
+            corpus AS c
+    )
+    , entities_relations AS (
+        SELECT 
+            c.id AS corpus_id
+            , LLM_EXTRACT_JSON(r.response) AS response
+        FROM 
+            c
+        JOIN TABLE(LLM_ENTITIES_RELATIONS(:completions_model , c.content, '')) AS r
+    )
+    SELECT 
+        corpus_id
+        , response
+    FROM 
+        entities_relations
+    EXCEPT 
+        SELECT 
+            0 AS corpus_id, 
+            {} AS response;
 
-        RETURN 'OK';
-    END;
+    /***
+    * Parse LLM responses stage.
+    **/
+    INSERT INTO nodes_edges_staging
+    WITH nodes_edges AS (
+        SELECT
+            LLM_ENTITIES_RELATIONS_TO_GRAPH(lr.corpus_id, lr.response) AS graph
+        FROM
+            llm_response AS lr
+    )
+    SELECT 
+        ne.graph[0]::ARRAY AS nodes
+        , ne.graph[1]::ARRAY AS edges
+    FROM
+        nodes_edges AS ne
+    EXCEPT 
+        SELECT 
+            [] AS nodes, 
+            [] AS edges;
+
+    /***
+    * Populate Data Stream source tables.
+    *
+    * These tables will be used for creating the downstream RelationalAI graph.
+    **/
+    -- Nodes table.
+    CREATE OR REPLACE TABLE nodes
+    AS
+    WITH nodes AS (
+        SELECT 
+            ne.nodes AS nodes
+        FROM 
+            nodes_edges_staging AS ne
+    )
+    SELECT 
+        VALUE:"id"::VARCHAR id 
+        , VALUE:"corpus_id"::INT corpus_id 
+        , VALUE:"type"::VARCHAR type 
+    FROM
+        nodes AS n 
+        , LATERAL FLATTEN(n.nodes) AS items;
+
+    -- Edges table.
+    CREATE OR REPLACE TABLE edges 
+    AS 
+    WITH edges AS ( 
+        SELECT 
+            ne.edges AS edges 
+        FROM 
+            nodes_edges_staging AS ne 
+    ) 
+    SELECT 
+        VALUE:"src_node_id"::VARCHAR src_node_id 
+        , VALUE:"dst_node_id"::VARCHAR dst_node_id 
+        , VALUE:"corpus_id"::INT corpus_id 
+        , VALUE:"type"::VARCHAR type 
+    FROM 
+        edges AS n 
+        , LATERAL FLATTEN(n.edges) AS items;
+
+    RETURN 'OK';
+END;
 $$;
 
 CREATE OR REPLACE FUNCTION LLM_SUMMARIZE(model VARCHAR, content VARCHAR) 
@@ -554,7 +586,7 @@ BEGIN
 
     counter := (max_community_id / :summarization_window) + 1;
     community_id_to := :summarization_window;
-  
+
     FOR i IN 1 TO counter DO
         INSERT INTO 
             temp_results 
@@ -629,7 +661,6 @@ BEGIN
     );
     
     RETURN TABLE(resultset);
-END;
 $$;
 
 /***
