@@ -661,6 +661,7 @@ BEGIN
     );
     
     RETURN TABLE(resultset);
+END;
 $$;
 
 /***
