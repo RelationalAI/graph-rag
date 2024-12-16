@@ -13,6 +13,6 @@ dependencies:
 - pip:
   - jupyterlab==4.2.2
   - python-dotenv==1.0.1
-  - relationalai==0.3.4
+  - relationalai==0.6.4
 - conda:
   - snowflake-snowpark-python==1.18.0

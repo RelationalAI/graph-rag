@@ -20,6 +20,25 @@ CREATE OR REPLACE TABLE community_summary(
 )
 COMMENT = 'Table to store community-based corpus summaries';
 
+CREATE OR REPLACE TABLE nodes(
+    ID VARCHAR(16777216)
+	, CORPUS_ID NUMBER(38,0)
+	, TYPE VARCHAR(16777216)
+)
+COMMENT = 'Table to store graph nodes';
+-- Enable data stream CDC.
+ALTER TABLE nodes SET CHANGE_TRACKING = TRUE;
+
+CREATE OR REPLACE TABLE edges(
+    SRC_NODE_ID VARCHAR(16777216)
+	, DST_NODE_ID VARCHAR(16777216)
+	, CORPUS_ID NUMBER(38,0)
+	, TYPE VARCHAR(16777216)
+)
+COMMENT = 'Table to store graph edges';
+-- Enable data stream CDC.
+ALTER TABLE edges SET CHANGE_TRACKING = TRUE;
+
 /***
 * Install UDFs.
 **/
@@ -34,7 +53,7 @@ import json
 import logging
 import re
 
-logger = logging.getLogger("python_logger")
+logger = logging.getLogger("graph_rag")
 logger.setLevel(logging.ERROR)
 
 def main(llm_response):
@@ -54,7 +73,11 @@ def main(llm_response):
             return {}
 $$;
 
-CREATE OR REPLACE FUNCTION LLM_ENTITIES_RELATIONS(model VARCHAR, content VARCHAR, additional_prompts VARCHAR DEFAULT '') 
+CREATE OR REPLACE FUNCTION LLM_ENTITIES_RELATIONS(
+    model VARCHAR
+    , content VARCHAR
+    , additional_prompts VARCHAR DEFAULT ''
+) 
 RETURNS TABLE 
 (response OBJECT) 
 LANGUAGE SQL 
@@ -131,7 +154,7 @@ $$
                             {
                                 "nodes": [
                                     {
-                                        "id": entity ID (required),
+                                        "id": entity name (required),
                                         "type": entity type (required),
                                         "properties": entity properties (optional)
                                     },
@@ -139,8 +162,8 @@ $$
                                 ],
                                 "relations": [
                                     {
-                                        "src_node_id": source entity ID (required),
-                                        "dst_node_id": destination entity ID (required),
+                                        "src_node_id": source entity name (required),
+                                        "dst_node_id": destination entity name (required),
                                         "type": relation type (required)
                                         "properties": relation properties (optional)
                                     },
@@ -173,121 +196,30 @@ $$
     ) AS response
 $$;
 
-CREATE OR REPLACE AGGREGATE FUNCTION LLM_ENTITIES_RELATIONS_TO_GRAPH(corpus_id INT, llm_response VARIANT)
+CREATE OR REPLACE AGGREGATE FUNCTION LLM_ENTITIES_RELATIONS_TO_GRAPH(
+    corpus_id INT
+    , llm_response VARIANT
+)
 RETURNS ARRAY
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.10'
 HANDLER = 'GraphBuilder'
-PACKAGES = ('networkx', 'snowflake')
 AS
 $$
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
-import networkx as nx
-import pandas as pd
-import snowflake.snowpark as snowpark
-
-logger = logging.getLogger("python_logger")
+logger = logging.getLogger("graph_rag")
 logger.setLevel(logging.ERROR)
 
 class GraphBuilder(object):
     def __init__(self) -> None:
-        self._graph: nx.Graph = nx.MultiDiGraph()
-
-    def _nodes_df(self) -> pd.DataFrame:
-        nodes_df: pd.DataFrame = None
-        nodes: List = []
-        edges: List = []
-        corpus_ids: List = []
-        node_types: List = []
-        props: List = []
-
-        try:
-            for node, properties in self._graph.nodes(data=True):
-                nodes.append(node)
-
-                try:
-                    corpus_ids.append(properties["corpus_id"])
-                except:
-                    corpus_ids.append(0)
-                    
-                try:
-                    node_types.append(properties["type"])
-                except:
-                    node_types.append("undefined")
-                    
-                if len(properties) > 0:
-                    props.append(properties)
-                else:
-                    props.append(0)
-    
-            nodes_df = pd.DataFrame(
-                data={
-                    "id": nodes,
-                    "corpus_id": corpus_ids, 
-                    "type": node_types,
-                    "properties": props
-                },
-                columns=["id", "corpus_id", "type", "properties"]
-            )
-        except Exception as error:
-            logger.error("Error calling _nodes_df function")
-            logger.error(error)
-            raise error
-        finally:
-            logger.info(f"Graph contains {len(nodes_df)} nodes")
-            return nodes_df
-
-    def _edges_df(self) -> pd.DataFrame:
-        edges_df: pd.DataFrame = None
-        src_nodes: List = []
-        dst_nodes: List = []
-        corpus_ids: List = []
-        edge_types: List = []
-        props: List = []
-
-        try:
-            for src_node, dst_node, properties in self._graph.edges(data=True):
-                src_nodes.append(src_node)
-                dst_nodes.append(dst_node)
-
-                try:
-                    corpus_ids.append(properties["corpus_id"])
-                except:
-                    corpus_ids.append(0)
-                    
-                try:
-                    edge_types.append(properties["type"])
-                except:
-                    edge_types.append("undefined")
-                    
-                if len(properties) > 0:
-                    props.append(properties)
-                else:
-                    props.append(None)
+        self._nodes: List = []
+        self._edges: List = []
         
-            edges_df = pd.DataFrame(
-                data={
-                    "src_node_id": src_nodes,
-                    "dst_node_id": dst_nodes,
-                    "corpus_id": corpus_ids, 
-                    "type": edge_types,
-                    "properties": props
-                },
-                columns=["src_node_id", "dst_node_id", "corpus_id", "type", "properties"]
-            )
-        except Exception as error:
-            logger.error("Error calling _edges_df function")
-            logger.error(error)
-            raise error
-        finally:
-            logger.info(f"Graph contains {len(edges_df)} edges")
-            return edges_df
-            
     @property
-    def aggregate_state(self) -> nx.Graph:
-        return self._graph
+    def aggregate_state(self) -> Union[List[Any], List[Any]]:
+        return [self._nodes, self._edges]
 
     # Add graph nodes and edges from LLM response.
     def accumulate(self, corpus_id, llm_response):
@@ -296,9 +228,18 @@ class GraphBuilder(object):
             for node in llm_response["nodes"]:
                 try:
                     if "properties" in node.keys():
-                        self._graph.add_node(node["id"], type=node["type"], corpus_id=corpus_id, **node["properties"])
+                        self._nodes.append({
+                            "id": node["id"],
+                            "corpus_id": corpus_id, 
+                            "type": node["type"], 
+                            "properties": node["properties"]
+                        })
                     else:
-                        self._graph.add_node(node["id"], type=node["type"], corpus_id=corpus_id)
+                        self._nodes.append({
+                            "id": node["id"],
+                            "corpus_id": corpus_id, 
+                            "type": node["type"]
+                        })
                 except Exception as error:
                     logger.error("Error accumulating graph nodes")
                     logger.error(error)
@@ -307,9 +248,22 @@ class GraphBuilder(object):
             for relation in llm_response["relations"]:
                 try:
                     if "properties" in relation.keys():
-                        self._graph.add_edge(relation["src_node_id"], relation["dst_node_id"], type=relation["type"], corpus_id=corpus_id, **relation["properties"])
+                        # self._graph.add_edge(relation["src_node_id"], relation["dst_node_id"], type=relation["type"], corpus_id=corpus_id, **relation["properties"])
+                        self._edges.append({
+                            "src_node_id": relation["src_node_id"], 
+                            "dst_node_id": relation["dst_node_id"], 
+                            "corpus_id": corpus_id, 
+                            "type": relation["type"], 
+                            "properties": relation["properties"]
+                        })
                     else:
-                        self._graph.add_edge(relation["src_node_id"], relation["dst_node_id"], type=relation["type"], corpus_id=corpus_id)
+                        # self._graph.add_edge(relation["src_node_id"], relation["dst_node_id"], type=relation["type"], corpus_id=corpus_id)
+                        self._edges.append({
+                            "src_node_id": relation["src_node_id"], 
+                            "dst_node_id": relation["dst_node_id"], 
+                            "corpus_id": corpus_id, 
+                            "type": relation["type"]
+                        })
                 except Exception as error:
                     logger.error("Error accumulating graph edges")
                     logger.error(error)
@@ -318,16 +272,15 @@ class GraphBuilder(object):
             logger.error("Error calling _edges_df function")
             logger.error(error)
     
-    def merge(self, graph) -> nx.Graph:
-        self._graph = nx.disjoint_union(self._graph, graph)
+    def merge(self, nodes_edges: Union[List[Any], List[Any]]) -> None:
+        self._nodes = self._nodes + nodes_edges[0]
+        self._edges = self._edges + nodes_edges[1]
 
     # Return accumulated graph nodes and edges.
-    def finish(self) -> List:
-        nodes_df = self._nodes_df()
-        edges_df = self._edges_df()
+    def finish(self) -> Union[List[Any], List[Any]]:
         return [
-            nodes_df.to_dict("records"),
-            edges_df.to_dict("records")
+            self._nodes,
+            self._edges
         ]
 $$;
 
@@ -399,9 +352,8 @@ BEGIN
     * These tables will be used for creating the downstream RelationalAI graph.
     **/
     -- Nodes table.
-    CREATE OR REPLACE TABLE nodes
-    AS
-    WITH nodes AS (
+    INSERT INTO nodes
+    WITH n AS (
         SELECT 
             ne.nodes AS nodes
         FROM 
@@ -412,13 +364,12 @@ BEGIN
         , VALUE:"corpus_id"::INT corpus_id 
         , VALUE:"type"::VARCHAR type 
     FROM
-        nodes AS n 
+        n
         , LATERAL FLATTEN(n.nodes) AS items;
 
     -- Edges table.
-    CREATE OR REPLACE TABLE edges 
-    AS 
-    WITH edges AS ( 
+    INSERT INTO edges
+    WITH e AS ( 
         SELECT 
             ne.edges AS edges 
         FROM 
@@ -430,14 +381,17 @@ BEGIN
         , VALUE:"corpus_id"::INT corpus_id 
         , VALUE:"type"::VARCHAR type 
     FROM 
-        edges AS n 
-        , LATERAL FLATTEN(n.edges) AS items;
+        e
+        , LATERAL FLATTEN(e.edges) AS items;
 
     RETURN 'OK';
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION LLM_SUMMARIZE(model VARCHAR, content VARCHAR) 
+CREATE OR REPLACE FUNCTION LLM_SUMMARIZE(
+    model VARCHAR
+    , content VARCHAR
+) 
 RETURNS TABLE 
 (response OBJECT) 
 LANGUAGE SQL 
@@ -559,7 +513,11 @@ $$
     ) AS response
 $$;
 
-CREATE OR REPLACE PROCEDURE LLM_ANSWER_SUMMARIES(completions_model VARCHAR, summarization_window INTEGER, question VARCHAR)  
+CREATE OR REPLACE PROCEDURE LLM_ANSWER_SUMMARIES(
+    completions_model VARCHAR
+    , summarization_window INTEGER
+    , question VARCHAR
+)  
 RETURNS TABLE 
 (
     answer VARIANT
